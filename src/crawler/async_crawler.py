@@ -1,9 +1,13 @@
 # libraries
 import aiohttp
 import asyncio
-import logging
+from crawler.parser import HTMLParser
 
-logger = logging.getLogger(__name__)
+# logging logic
+import logging
+from crawler.logger import setup_crawler_logger
+logger = setup_crawler_logger(level=logging.INFO)
+
 
 # code
 class AsyncCrawler:
@@ -32,7 +36,7 @@ class AsyncCrawler:
             connector=connector
         )
 
-        pass
+        self.parser = HTMLParser()
 
     # one page loading / загрузка одной страницы
     async def fetch_url(self, url: str) -> str:
@@ -82,6 +86,48 @@ class AsyncCrawler:
         # return dict(results)
         return results
 
+    async def fetch_and_parse(self, url: str) -> dict:
+        """
+        Fetch page and parse it.
+        / Загружает страницу и парсит её.
+        Returns:
+        {
+            url: str,
+            title: str,
+            text: str,
+            links: list[str],
+            metadata: dict
+        }
+        """
+        html = await self.fetch_url(url)
+
+        # если произошла ошибка загрузки — возвращаем структуру с пустыми данными
+        if html.startswith(("HTTP ERROR", "TIMEOUT ERROR", "NETWORK ERROR", "UNEXPECTED ERROR")):
+            return {
+                "url": url,
+                "title": "",
+                "text": "",
+                "links": [],
+                "metadata": {},
+                "images": [],
+                "headers": {},
+                "tables": [],
+                "lists": {}
+            }
+            # return {
+            #     "url": url,
+            #     "title": "",
+            #     "text": "",
+            #     "links": [],
+            #     "metadata": {},
+            # }
+
+        parsed_data = await self.parser.parse_html(html, url)
+
+        return parsed_data
+
     # session closing / закрытие сессии
     async def close(self):
         await self.session.close()
+
+
