@@ -1,5 +1,6 @@
 import pytest
-from src.crawler.async_crawler import HTMLParser
+# from src.crawler.async_crawler import HTMLParser
+from src.crawler.parser import HTMLParser
 from src.crawler.logger import setup_crawler_logger
 
 # Настройка логгера для тестов
