@@ -1,189 +1,180 @@
 # libraries
 import aiohttp
 import asyncio
-from crawler.parser import HTMLParser
-
-# logging logic
 import logging
+import time
+import re
+import random
+from urllib.parse import urljoin, urldefrag, urlparse
+
+from crawler.parser import HTMLParser
 from crawler.logger import setup_crawler_logger
+from crawler.semaphore_manager import SemaphoreManager
+from crawler.queue import CrawlerQueue
+from crawler.rate_limiter import RateLimiter
+from crawler.robots_parser import RobotsParser
 
 logger = setup_crawler_logger(level=logging.INFO)
 
-from crawler.semaphore_manager import SemaphoreManager
 
-from crawler.queue import CrawlerQueue
-from urllib.parse import urljoin, urldefrag
-
-from urllib.parse import urlparse
-
-import time
-
-import re
-
-# code
 class AsyncCrawler:
-    # initialization with concurrency constraints / инициализация с ограничением конкурентности
     def __init__(
         self,
-        max_concurrent: int = 10,
+        max_concurrent: int = 5,
+        allowed_domains: list[str] | None = None,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        max_depth: int = 2,
+        requests_per_second: float = 1.0,
+        respect_robots: bool = True,
+        min_delay: float = 0.0,
+        jitter: float = 0.0,
+        user_agent: str = "AsyncCrawler/1.0",
         timeout: aiohttp.ClientTimeout = None,
-        allowed_domains: list[str] = None,
-        rate_limit: float = 0,
-        include_patterns: list[str] = None,
-        exclude_patterns: list[str] = None,
     ):
         self.max_concurrent = max_concurrent
+        self.max_depth = max_depth
 
-        self.semaphore_manager = SemaphoreManager(
-            global_limit=20,
-            per_domain_limit=5
-        )
-
-        # Timeouts: connect/read
-        if timeout is None:
-            timeout = aiohttp.ClientTimeout(
-                connect=5,  # TCP connection establishment timeout / таймаут установки TCP-соединения
-                sock_read=10  # response read timeout / таймаут чтения ответа
-            )
-
-        # Connection pooling
-        connector = aiohttp.TCPConnector(
-            limit=100,  # simultaneous connection count / всего одновременных соединений
-            limit_per_host=10,  # connection count per host/ на один хост
-            keepalive_timeout=30
-        )
-
-        # Client session creation
-        self.session = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector
-        )
-
-        self.parser = HTMLParser()
-
-        # --- Управление состоянием URL ---
-        self.visited_urls: set[str] = set()
-        self.failed_urls: dict[str, str] = {}  # URL -> ошибка
-        self.processed_urls: dict[str, dict] = {}  # URL -> результат парсинга
-
-        # --- Ограничение доменов и rate limit ---
-        self.allowed_domains = allowed_domains  # список разрешённых доменов, например ['example.com', 'python.org']
-        self.rate_limit = rate_limit  # минимальная задержка между запросами к одному домену в секундах
-        self._domain_last_access: dict[str, float] = {}  # когда последний раз делался запрос к домену
-
-        # --- Фильтрация URL по паттернам ---
+        # --- URL filters ---
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
 
-    # checking urls before adding one to the queue / проверка при добавлении ссылок в очередь
+        # --- Crawler state ---
+        self.visited_urls: set[str] = set()
+        self.failed_urls: dict[str, str] = {}
+        self.processed_urls: dict[str, dict] = {}
+        self.blocked_urls_by_robots: set[str] = set()
+        self.request_times: list[float] = []
+
+        # --- Semaphore / concurrency ---
+        self.semaphore_manager = SemaphoreManager(global_limit=20, per_domain_limit=5)
+
+        # --- Timeout & session ---
+        if timeout is None:
+            timeout = aiohttp.ClientTimeout(connect=5, sock_read=10)
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=10, keepalive_timeout=30)
+        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+        # --- Parser ---
+        self.parser = HTMLParser()
+
+        # --- Rate limiter ---
+        self.rate_limiter = RateLimiter(
+            requests_per_second=requests_per_second,
+            per_domain=True,
+            min_delay=min_delay,
+            jitter=jitter,
+        )
+
+        # --- Robots.txt ---
+        self.robots_parser = RobotsParser()
+        self.respect_robots = respect_robots
+        self.user_agent = user_agent
+
+        # --- Allowed domains ---
+        self.allowed_domains = allowed_domains
+
+    # --- Domain filter ---
     def _is_allowed_domain(self, url: str) -> bool:
         if not self.allowed_domains:
             return True
         domain = urlparse(url).netloc
-        return any(domain.endswith(allowed) for allowed in self.allowed_domains)
+        return any(domain.endswith(a) for a in self.allowed_domains)
 
-    # --- Проверка паттернов include/exclude ---
+    # --- URL filter ---
     def _is_allowed_url(self, url: str) -> bool:
         if not self._is_allowed_domain(url):
             return False
-
         for pattern in self.exclude_patterns:
             if re.search(pattern, url):
                 return False
-
         if self.include_patterns:
-            for pattern in self.include_patterns:
-                if re.search(pattern, url):
-                    return True
-            return False  # ни один include не совпал
-
+            return any(re.search(p, url) for p in self.include_patterns)
         return True
 
-    # one page loading / загрузка одной страницы
+    # --- Fetch one page ---
     async def fetch_url(self, url: str) -> str:
         domain = urlparse(url).netloc
 
-        # --- rate limit ---
-        if self.rate_limit > 0:
-            last_access = self._domain_last_access.get(domain, 0)
-            wait_time = self.rate_limit - (time.time() - last_access)
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-        self._domain_last_access[domain] = time.time()
+        # --- Respect robots.txt ---
+        crawl_delay = 0
+        if self.respect_robots:
+            await self.robots_parser.fetch_robots(domain)
+            allowed = await self.robots_parser.can_fetch(url, self.user_agent)
+            if not allowed:
+                logger.info(f"🚫 Blocked by robots.txt: {url}")
+                self.failed_urls[url] = "Blocked by robots.txt"
+                self.blocked_urls_by_robots.add(url)
+                return ""
+            crawl_delay = await self.robots_parser.get_crawl_delay(self.user_agent) or 0
 
-        async with self.semaphore_manager.limit(url):
+        # --- Wait for rate limiter and crawl-delay ---
+        await self.rate_limiter.acquire(domain)
+        if crawl_delay > 0:
+            await asyncio.sleep(crawl_delay)
 
-            logger.debug(f"▶️ Start fetching: {url}")
+        max_attempts = 3
+        backoff = 1
+        attempt = 0
 
-            try:
-                async with self.session.get(url) as response:
-                    # check for exceptions / проверка на исключения: 2хх oк, 4хх исключение
-                    response.raise_for_status()
-                    text = await response.text()
+        while attempt < max_attempts:
+            async with self.semaphore_manager.limit(url):
+                try:
+                    headers = {"User-Agent": self.user_agent}
+                    start_req = time.time()
+                    async with self.session.get(url, headers=headers) as response:
+                        response.raise_for_status()
+                        text = await response.text()
+                        self.request_times.append(time.time() - start_req)
+                        logger.info(f"✅ Success {response.status}: {url}")
+                        return text
 
-                    logger.info(f"✅ Success {response.status}: {url}")
-                    return text
+                except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.warning(f"⚠️ Error for {url}: {e}")
+                    attempt += 1
+                    await asyncio.sleep(backoff + random.random() * 0.5)
+                    backoff *= 2
+                    self.failed_urls[url] = str(e)
+                except Exception as e:
+                    logger.exception(f"⚠️ Unexpected error for {url}")
+                    self.failed_urls[url] = str(e)
+                    return ""
+        return ""
 
-            # HTTP errors / HTTP ошибки (404, 500, ...)
-            except aiohttp.ClientResponseError as e:
-                logger.warning(f"⚠️ HTTP error {e.status} for {url}")
-                return f"HTTP ERROR {e.status}: {e.message}"
-            # timeout error / ошибка таймаута
-            except asyncio.TimeoutError:
-                logger.warning(f"⚠️ Timeout error for {url}")
-                return f"TIMEOUT ERROR"
-            # network errors / сетевые ошибки
-            except aiohttp.ClientError as e:
-                logger.error(f"⚠️ Network error for {url}: {e}")
-                return f"NETWORK ERROR: {e}"
-            # others / остальное
-            except Exception as e:
-                logger.exception(f"⚠️ Unexpected error for {url}")
-                return f"UNEXPECTED ERROR: {e}"
-
-    # ready html parsing
+    # --- Parse HTML ---
     async def parse_html(self, url: str, html: str) -> dict:
         return await self.parser.parse_html(html, url)
 
+    # --- Process one page ---
     async def _process_url(self, url: str):
         if url in self.visited_urls:
             return None
         self.visited_urls.add(url)
 
         html = await self.fetch_url(url)
-
-        if html.startswith(("HTTP ERROR", "TIMEOUT ERROR", "NETWORK ERROR", "UNEXPECTED ERROR")):
-            self.failed_urls[url] = html
+        if not html:
             return None
 
         parsed = await self.parse_html(url, html)
         self.processed_urls[url] = parsed
         return parsed
 
-    # --- Crawl engine с max_depth, max_pages, фильтрацией и автоматическим добавлением ссылок ---
-    async def crawl(
-        self,
-        start_urls: list[str],
-        max_pages: int = 100,
-        max_depth: int = 2,
-        progress_interval: float = 2.0
-    ):
+    # --- Crawl engine ---
+    async def crawl(self, start_urls: list[str], max_pages: int = 100, progress_interval: float = 2.0):
         queue = CrawlerQueue()
         results = []
 
-        # Добавляем стартовые URL с depth=0
         for url in start_urls:
             if self._is_allowed_url(url):
-                await queue.add_url(url, priority=0)
+                await queue.add_url(url, 0)
 
         async def worker():
             nonlocal results
             while len(self.visited_urls) < max_pages:
                 item = await queue.get_next()
                 if not item:
-                    return
-
-                url, depth = item  # priority теперь выступает как depth
+                    break
+                url, depth = item
                 if url in self.visited_urls:
                     continue
 
@@ -191,17 +182,18 @@ class AsyncCrawler:
                 if parsed:
                     results.append(parsed)
 
-                    # Ограничение глубины
-                    if depth < max_depth:
-                        for link in parsed.get("links", []):
-                            absolute = urljoin(url, link)
-                            absolute, _ = urldefrag(absolute)
-                            if absolute not in self.visited_urls and self._is_allowed_url(absolute):
-                                await queue.add_url((absolute, depth + 1))
+                    # --- Safe link traversal ---
+                    for link in parsed.get("links", []):
+                        if not isinstance(link, str) or not link.strip():
+                            continue
+                        # if isinstance(link, tuple):
+                        #     link = link[0]
+                        absolute = urljoin(url, link)
+                        absolute, _ = urldefrag(absolute)
+                        if self._is_allowed_url(absolute) and depth + 1 <= self.max_depth:
+                            await queue.add_url(absolute, depth + 1)
 
-        # Запускаем воркеров
         workers = [asyncio.create_task(worker()) for _ in range(self.max_concurrent)]
-        # Запускаем прогресс-логгер
         progress_task = asyncio.create_task(self._progress_logger(queue, interval=progress_interval))
 
         try:
@@ -212,28 +204,39 @@ class AsyncCrawler:
 
         return results
 
+    # --- Progress logger ---
     async def _progress_logger(self, queue: CrawlerQueue, interval: float = 2.0):
-        start_time = time.time()
-        prev_processed = 0
+        prev_count = 0
         while True:
             processed_count = len(self.processed_urls)
-            in_queue = queue._queue.qsize()
             failed_count = len(self.failed_urls)
-            elapsed = time.time() - start_time
-            speed = (processed_count - prev_processed) / interval
-            prev_processed = processed_count
+            blocked_count = len(self.blocked_urls_by_robots)
+            in_queue = queue._queue.qsize()
+
+            # скорость и средняя задержка
+            speed = (processed_count - prev_count) / interval
+            prev_count = processed_count
+            avg_delay = sum(self.request_times) / len(self.request_times) if self.request_times else 0
 
             logger.info(
                 f"📄 Processed: {processed_count} | "
                 f"⏳ In queue: {in_queue} | "
                 f"❌ Failed: {failed_count} | "
-                f"⚡️ Speed: {speed:.2f} pages/sec"
+                f"🚫 Blocked: {blocked_count} | "
+                f"⚡️ Speed: {speed:.2f} pages/sec | "
+                f"⏱️ Avg delay: {avg_delay:.2f}s"
             )
 
-            if in_queue == 0 and processed_count + failed_count >= len(self.visited_urls):
-                break
+            # если очередь пуста И все воркеры закончили, то выходим
+            if in_queue == 0:
+                # даём время воркерам проверить последние URL
+                await asyncio.sleep(interval)
+                in_queue_after_sleep = queue._queue.qsize()
+                if in_queue_after_sleep == 0:
+                    break
 
             await asyncio.sleep(interval)
 
+    # --- Close session ---
     async def close(self):
         await self.session.close()
