@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from crawler.queue import CrawlerQueue
-from src.crawler.async_crawler import AsyncCrawler
+from crawler.async_crawler import AsyncCrawler
 
 # -----------------------------
 # 0️⃣ Фикстура для тестового краулера

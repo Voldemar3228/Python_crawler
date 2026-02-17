@@ -6,6 +6,7 @@ import time
 import re
 import random
 from urllib.parse import urljoin, urldefrag, urlparse
+import async_timeout
 
 from crawler.parser import HTMLParser
 from crawler.logger import setup_crawler_logger
@@ -13,6 +14,15 @@ from crawler.semaphore_manager import SemaphoreManager
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.robots_parser import RobotsParser
+from crawler.retry_strategy import RetryStrategy
+from crawler.errors import (
+    TransientError,
+    PermanentError,
+    NetworkError,
+    ParseError,
+)
+from crawler.circuit_breaker import CircuitBreaker
+
 
 logger = setup_crawler_logger(level=logging.INFO)
 
@@ -31,6 +41,9 @@ class AsyncCrawler:
         jitter: float = 0.0,
         user_agent: str = "AsyncCrawler/1.0",
         timeout: aiohttp.ClientTimeout = None,
+        connect_timeout=5,
+        read_timeout=10,
+        total_timeout=15
     ):
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -49,11 +62,11 @@ class AsyncCrawler:
         # --- Semaphore / concurrency ---
         self.semaphore_manager = SemaphoreManager(global_limit=20, per_domain_limit=5)
 
-        # --- Timeout & session ---
-        if timeout is None:
-            timeout = aiohttp.ClientTimeout(connect=5, sock_read=10)
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=10, keepalive_timeout=30)
-        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        # # --- Timeout & session ---
+        # if timeout is None:
+        #     timeout = aiohttp.ClientTimeout(connect=5, sock_read=10)
+        # connector = aiohttp.TCPConnector(limit=100, limit_per_host=10, keepalive_timeout=30)
+        # self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
         # --- Parser ---
         self.parser = HTMLParser()
@@ -73,6 +86,113 @@ class AsyncCrawler:
 
         # --- Allowed domains ---
         self.allowed_domains = allowed_domains
+
+        def _on_retry(exc, attempt, exc_type):
+            logger.warning(f"🔁 Retry {attempt} for {exc_type.__name__}: {exc}")
+
+        # --- Retry strategy ---
+        self.retry_strategy = RetryStrategy(
+            strategy={
+                TransientError: {
+                    "max_retries": 3,
+                    "backoff_factor": 2.0,
+                    "timeout_factor": 1.5  # каждый retry увеличивает таймаут на 50%
+                },
+                NetworkError: {
+                    "max_retries": 2,
+                    "backoff_factor": 1.5,
+                    "timeout_factor": 1.2
+                }
+                # PermanentError не указан → не ретраится
+            },
+            on_retry=_on_retry,
+        )
+
+        # stats
+        self.stats = {
+            "errors": {},  # количество ошибок по типам, например: {"TransientError": 3}
+            "success_retries": 0,  # сколько успешных повторов было
+            "retry_times": [],  # время выполнения retry
+            "permanent_failed_urls": {}  # список URL с PermanentError
+        }
+
+        # Timeouts logic
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.total_timeout = total_timeout
+        self.session = None  # aiohttp session создаём в __aenter__
+
+        # for CircuitBreaker
+        self.circuit_breaker = CircuitBreaker(
+            max_errors=5,
+            window=60.0,
+            reset_timeout=30.0
+        )
+
+    # async def _do_request(self, url: str) -> str:
+    async def _do_request(self, url: str, **kwargs) -> str:
+        """
+        Выполняет HTTP GET с обработкой transient/permanent ошибок.
+        Устойчиво к разрывам соединения и проблемам с текстом.
+        """
+        if not self.session:
+            raise RuntimeError("Session is not initialized. Use 'async with AsyncCrawler()'")
+
+        headers = {"User-Agent": self.user_agent}
+        start_req = time.time()
+        timeout = self.total_timeout
+
+        try:
+            async with async_timeout.timeout(timeout):
+                async with self.session.get(url, headers=headers) as response:
+                    # --- классификация по статусу ---
+                    if response.status in (429, 503):
+                        raise TransientError(f"HTTP {response.status}", status=response.status)
+                    if response.status == 500:
+                        raise TransientError("HTTP 500 Server Error", status=500)
+                    if response.status in (401, 403, 404):
+                        raise PermanentError(f"HTTP {response.status}", status=response.status)
+
+                    response.raise_for_status()
+
+                    # --- безопасное чтение тела ---
+                    try:
+                        content = await response.read()  # читаем как bytes
+                        text = content.decode("utf-8", errors="replace")  # безопасное декодирование
+                    except Exception as e:
+                        raise TransientError(f"Failed to read/parse response: {e}") from e
+
+                    self.request_times.append(time.time() - start_req)
+                    logger.info(f"✅ Success {response.status}: {url}")
+                    return text
+
+        except PermanentError:
+            # фиксируем PermanentError, чтобы не превращать в TransientError
+            raise
+
+        except asyncio.TimeoutError as e:
+            raise TransientError("Timeout") from e
+        except aiohttp.ClientConnectorError as e:
+            raise NetworkError("Connection error") from e
+        except aiohttp.ServerDisconnectedError as e:
+            # сервер разорвал соединение
+            raise TransientError("Server disconnected") from e
+        except aiohttp.ClientError as e:
+            raise TransientError(f"Client error: {e}") from e
+
+    # async context manager
+    async def __aenter__(self):
+        timeout = aiohttp.ClientTimeout(
+            total=self.total_timeout,
+            connect=self.connect_timeout,
+            sock_read=self.read_timeout
+        )
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=10, keepalive_timeout=30)
+        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
 
     # --- Domain filter ---
     def _is_allowed_domain(self, url: str) -> bool:
@@ -96,7 +216,14 @@ class AsyncCrawler:
     async def fetch_url(self, url: str) -> str:
         domain = urlparse(url).netloc
 
-        # --- Respect robots.txt ---
+        # --- Circuit breaker ---
+        if self.circuit_breaker.is_blocked(domain):
+            remaining = self.circuit_breaker.get_remaining_block(domain)
+            logger.warning(f"🚫 Domain {domain} is temporarily blocked ({remaining:.1f}s remaining)")
+            self.failed_urls[url] = f"Blocked by circuit breaker ({remaining:.1f}s)"
+            return ""
+
+        # --- robots.txt + rate limiter ---
         crawl_delay = 0
         if self.respect_robots:
             await self.robots_parser.fetch_robots(domain)
@@ -108,42 +235,58 @@ class AsyncCrawler:
                 return ""
             crawl_delay = await self.robots_parser.get_crawl_delay(self.user_agent) or 0
 
-        # --- Wait for rate limiter and crawl-delay ---
         await self.rate_limiter.acquire(domain)
         if crawl_delay > 0:
             await asyncio.sleep(crawl_delay)
 
-        max_attempts = 3
-        backoff = 1
-        attempt = 0
+        # --- функция для фиксации ошибок ---
+        def record_error_stats(exc):
+            name = type(exc).__name__
+            self.stats["errors"][name] = self.stats["errors"].get(name, 0) + 1
+            self.failed_urls[url] = str(exc)
 
-        while attempt < max_attempts:
-            async with self.semaphore_manager.limit(url):
-                try:
-                    headers = {"User-Agent": self.user_agent}
-                    start_req = time.time()
-                    async with self.session.get(url, headers=headers) as response:
-                        response.raise_for_status()
-                        text = await response.text()
-                        self.request_times.append(time.time() - start_req)
-                        logger.info(f"✅ Success {response.status}: {url}")
-                        return text
+        # --- Callback для retry ---
+        def on_retry(exc, attempt, exc_type, delay=None, url=url):
+            name = exc_type.__name__
+            self.stats["errors"][name] = self.stats["errors"].get(name, 0) + 1
 
-                except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logger.warning(f"⚠️ Error for {url}: {e}")
-                    attempt += 1
-                    await asyncio.sleep(backoff + random.random() * 0.5)
-                    backoff *= 2
-                    self.failed_urls[url] = str(e)
-                except Exception as e:
-                    logger.exception(f"⚠️ Unexpected error for {url}")
-                    self.failed_urls[url] = str(e)
-                    return ""
-        return ""
+            delay_str = f"{delay:.2f}s" if delay else "-"
+            logger.warning(f"🏷️ {name} | 🔗 {url} | 🔢 Attempt {attempt} | ⏰ Next try in {delay_str} | 🎯 Retrying")
+
+            if attempt > 1:
+                self.stats["success_retries"] += 1
+            if delay:
+                self.stats["retry_times"].append(delay)
+
+            self.failed_urls[url] = str(exc)
+
+        self.retry_strategy.on_retry = on_retry
+
+        # --- Semaphore + retry ---
+        async with self.semaphore_manager.limit(url):
+            try:
+                result = await self.retry_strategy.execute_with_retry(self._do_request, url=url)
+                logger.info(f"🎯 Success | 🔗 {url}")
+                return result
+
+            except PermanentError as e:
+                record_error_stats(e)
+                logger.error(f"🚫 Permanent failure | 🔗 {url} | Reason: {str(e)}")
+                return ""
+
+            except Exception as e:
+                record_error_stats(e)
+                logger.exception(f"❌ Failed after retries {url}: {e}")
+                self.circuit_breaker.record_error(domain)
+                return ""
 
     # --- Parse HTML ---
     async def parse_html(self, url: str, html: str) -> dict:
-        return await self.parser.parse_html(html, url)
+        try:
+            return await self.parser.parse_html(html, url)
+        except Exception as e:
+            logger.exception(f"Parse error for {url}")
+            raise ParseError(str(e)) from e
 
     # --- Process one page ---
     async def _process_url(self, url: str):
@@ -239,4 +382,5 @@ class AsyncCrawler:
 
     # --- Close session ---
     async def close(self):
-        await self.session.close()
+        if self.session and not self.session.closed:
+            await self.session.close()
