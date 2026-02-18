@@ -38,11 +38,15 @@ class CrawlerQueue:
         """
         Возвращает (url, depth)
         """
-        if self._queue.empty():
-            return None
 
         depth, url = await self._queue.get()
         return url, depth
+
+    def task_done(self):
+        self._queue.task_done()
+
+    async def join(self):
+        await self._queue.join()
 
     def mark_processed(self, url: str):
         self._processed.add(url)

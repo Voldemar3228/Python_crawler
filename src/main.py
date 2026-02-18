@@ -1,91 +1,108 @@
-# main.py
+# demo.py
 import asyncio
 import json
-from aiohttp import web
+import csv
+import aiosqlite
+from datetime import datetime
+
 from crawler.async_crawler import AsyncCrawler
-from crawler.errors import TransientError, PermanentError
+from storage.json_storage import JSONStorage
+from storage.csv_storage import CSVStorage
+from storage.sqlite_storage import SQLiteStorage
 
-# --- 1️⃣ Локальный сервер с разными статусами ---
-async def handler_200(request):
-    return web.Response(text="✅ OK", status=200)
 
-async def handler_500(request):
-    return web.Response(text="⚠️ Server Error", status=500)
+async def demo():
+    # -----------------------
+    # 1️⃣ Создаём хранилища
+    # -----------------------
+    json_storage = JSONStorage("demo_results.json", batch_size=10)
+    csv_storage = CSVStorage("demo_results.csv", batch_size=10)
+    sqlite_storage = SQLiteStorage("demo_results.db", batch_size=10)
+    await sqlite_storage.init_db()
 
-async def handler_503(request):
-    return web.Response(text="⚠️ Service Unavailable", status=503)
-
-async def handler_404(request):
-    return web.Response(text="❌ Not Found", status=404)
-
-def create_test_server():
-    app = web.Application()
-    app.router.add_get("/200", handler_200)
-    app.router.add_get("/500", handler_500)
-    app.router.add_get("/503", handler_503)
-    app.router.add_get("/404", handler_404)
-    runner = web.AppRunner(app)
-    return runner
-
-# --- 2️⃣ Асинхронная функция main ---
-async def main():
-    # --- Стартуем локальный сервер на 8080 ---
-    runner = create_test_server()
-    await runner.setup()
-    site = web.TCPSite(runner, "localhost", 8080)
-    await site.start()
-    print("🌐 Test server running at http://localhost:8080")
-
-    # --- URL для теста ---
-    test_urls = [
-        "http://localhost:8080/200",  # успех
-        "http://localhost:8080/500",  # transient → retry
-        "http://localhost:8080/503",  # transient → retry
-        "http://localhost:8080/404",  # permanent → no retry
-    ]
-
-    # --- Создаём и запускаем crawler ---
+    # -----------------------
+    # 2️⃣ Краулер с одновременным сохранением
+    # -----------------------
     async with AsyncCrawler(
         max_concurrent=3,
         max_depth=1,
-        respect_robots=False  # чтобы локальный сервер не мешал robots.txt
+        storage=None  # будем сохранять вручную после парсинга
     ) as crawler:
 
-        print("\n🚀 Starting crawl...\n")
-        results = await crawler.crawl(test_urls, max_pages=10)
+        # Функция для сохранения во все три хранилища
+        async def save_all(data):
+            await asyncio.gather(
+                json_storage.save(data),
+                csv_storage.save(data),
+                sqlite_storage.save(data)
+            )
 
-        print("\n✅ Crawl finished\n")
+        start_urls = ["https://example.com"]
+        results = []
 
-        # --- Статистика ---
-        print("📊 ===== Statistics =====")
-        print("Processed URLs:", len(crawler.processed_urls))
-        print("Failed URLs:", len(crawler.failed_urls))
-        print("Errors by type:", crawler.stats["errors"])
-        print("Successful retries:", crawler.stats["success_retries"])
+        # Оборачиваем оригинальный _process_url, чтобы добавить сохранение
+        original_process = crawler._process_url
 
-        if crawler.stats["retry_times"]:
-            avg_retry = sum(crawler.stats["retry_times"]) / len(crawler.stats["retry_times"])
-        else:
-            avg_retry = 0
+        async def _process_and_save(url):
+            standardized = await original_process(url)
+            if standardized:
+                await save_all(standardized)
+                results.append(standardized)
+            return standardized
 
-        print(f"Average retry delay: {avg_retry:.2f}s")
+        crawler._process_url = _process_and_save  # временно заменяем метод
 
-        # --- Сохраняем отчёт ---
-        report = {
-            "processed_urls": list(crawler.processed_urls.keys()),
-            "failed_urls": crawler.failed_urls,
-            "error_stats": crawler.stats,
-        }
+        # Запускаем краулер
+        await crawler.crawl(start_urls, max_pages=5)
 
-        with open("crawler_report.json", "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=4, ensure_ascii=False)
+    # -----------------------
+    # 3️⃣ Закрываем хранилища
+    # -----------------------
+    await asyncio.gather(
+        json_storage.close(),
+        csv_storage.close(),
+        sqlite_storage.close()
+    )
 
-        print("\n📄 Report saved to crawler_report.json")
+    # -----------------------
+    # 4️⃣ Статистика
+    # -----------------------
+    print("🔹 Statistics:")
+    print(f"Pages crawled: {len(results)}")
+    print(f"JSON pages: {len(results)}")
+    print(f"CSV pages: {len(results)}")
+    print(f"SQLite pages: {len(results)}\n")
 
-    # --- Выключаем сервер ---
-    await runner.cleanup()
-    print("🛑 Test server stopped.")
+    # -----------------------
+    # 5️⃣ Чтение данных
+    # -----------------------
+    # JSON
+    print("Reading first 3 pages from JSON:")
+    with open("demo_results.json", "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= 3:
+                break
+            data = json.loads(line)
+            print(f"{i+1}. {data['url']} - {data['title']}")
 
-# --- 3️⃣ Запуск ---
+    # CSV
+    print("\nReading first 3 pages from CSV:")
+    with open("demo_results.csv", "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i >= 3:
+                break
+            print(f"{i+1}. {row['url']} - {row['title']}")
+
+    # SQLite
+    print("\nReading first 3 pages from SQLite:")
+    async with aiosqlite.connect("demo_results.db") as db:
+        async with db.execute("SELECT url, title FROM pages LIMIT 3") as cursor:
+            i = 0
+            async for row in cursor:
+                i += 1
+                print(f"{i}. {row[0]} - {row[1]}")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(demo())

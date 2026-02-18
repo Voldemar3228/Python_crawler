@@ -7,6 +7,7 @@ import re
 import random
 from urllib.parse import urljoin, urldefrag, urlparse
 import async_timeout
+from datetime import datetime
 
 from crawler.parser import HTMLParser
 from crawler.logger import setup_crawler_logger
@@ -22,28 +23,29 @@ from crawler.errors import (
     ParseError,
 )
 from crawler.circuit_breaker import CircuitBreaker
-
+from storage.base import DataStorage
 
 logger = setup_crawler_logger(level=logging.INFO)
 
 
 class AsyncCrawler:
     def __init__(
-        self,
-        max_concurrent: int = 5,
-        allowed_domains: list[str] | None = None,
-        include_patterns: list[str] | None = None,
-        exclude_patterns: list[str] | None = None,
-        max_depth: int = 2,
-        requests_per_second: float = 1.0,
-        respect_robots: bool = True,
-        min_delay: float = 0.0,
-        jitter: float = 0.0,
-        user_agent: str = "AsyncCrawler/1.0",
-        timeout: aiohttp.ClientTimeout = None,
-        connect_timeout=5,
-        read_timeout=10,
-        total_timeout=15
+            self,
+            max_concurrent: int = 5,
+            allowed_domains: list[str] | None = None,
+            include_patterns: list[str] | None = None,
+            exclude_patterns: list[str] | None = None,
+            max_depth: int = 2,
+            requests_per_second: float = 1.0,
+            respect_robots: bool = True,
+            min_delay: float = 0.0,
+            jitter: float = 0.0,
+            user_agent: str = "AsyncCrawler/1.0",
+            timeout: aiohttp.ClientTimeout = None,
+            connect_timeout=5,
+            read_timeout=10,
+            total_timeout=15,
+            storage: DataStorage | None = None
     ):
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -78,6 +80,8 @@ class AsyncCrawler:
             min_delay=min_delay,
             jitter=jitter,
         )
+
+        self.storage = storage
 
         # --- Robots.txt ---
         self.robots_parser = RobotsParser()
@@ -260,12 +264,17 @@ class AsyncCrawler:
 
             self.failed_urls[url] = str(exc)
 
-        self.retry_strategy.on_retry = on_retry
+        # self.retry_strategy.on_retry = on_retry
 
         # --- Semaphore + retry ---
         async with self.semaphore_manager.limit(url):
             try:
-                result = await self.retry_strategy.execute_with_retry(self._do_request, url=url)
+                result = await self.retry_strategy.execute_with_retry(
+                    self._do_request,
+                    url=url,
+                    on_retry=on_retry
+                )
+
                 logger.info(f"🎯 Success | 🔗 {url}")
                 return result
 
@@ -299,8 +308,40 @@ class AsyncCrawler:
             return None
 
         parsed = await self.parse_html(url, html)
-        self.processed_urls[url] = parsed
-        return parsed
+
+        # 🔹 Стандартизация структуры данных
+        standardized = {
+            "url": url,
+            "title": parsed.get("title", ""),
+            "text": parsed.get("text", ""),
+            "links": parsed.get("links", []),
+            "metadata": parsed.get("metadata", {}),
+            "crawled_at": datetime.utcnow(),
+            "status_code": parsed.get("status_code", 200),
+            "content_type": parsed.get("content_type", "text/html")
+        }
+
+        self.processed_urls[url] = standardized
+        # 🔹 Добавляем сохранение данных через retry
+        if self.storage:
+            await self._save_with_retry(standardized)
+
+        return standardized
+
+    async def _save_with_retry(self, data, retries=3, delay=1):
+        """
+        Сохраняет данные через storage с повторными попытками при ошибках.
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                await self.storage.save(data)
+                return
+            except Exception as e:
+                logger.warning(f"Save attempt {attempt} failed for {data['url']}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Failed to save after {retries} attempts: {data['url']}")
 
     # --- Crawl engine ---
     async def crawl(self, start_urls: list[str], max_pages: int = 100, progress_interval: float = 2.0):
@@ -313,37 +354,46 @@ class AsyncCrawler:
 
         async def worker():
             nonlocal results
-            while len(self.visited_urls) < max_pages:
-                item = await queue.get_next()
-                if not item:
-                    break
-                url, depth = item
-                if url in self.visited_urls:
-                    continue
 
-                parsed = await self._process_url(url)
-                if parsed:
-                    results.append(parsed)
+            while True:
+                url, depth = await queue.get_next()
 
-                    # --- Safe link traversal ---
-                    for link in parsed.get("links", []):
-                        if not isinstance(link, str) or not link.strip():
-                            continue
-                        # if isinstance(link, tuple):
-                        #     link = link[0]
-                        absolute = urljoin(url, link)
-                        absolute, _ = urldefrag(absolute)
-                        if self._is_allowed_url(absolute) and depth + 1 <= self.max_depth:
-                            await queue.add_url(absolute, depth + 1)
+                try:
+                    if url in self.visited_urls:
+                        continue
+
+                    parsed = await self._process_url(url)
+                    if parsed:
+                        results.append(parsed)
+
+                        for link in parsed.get("links", []):
+                            if not isinstance(link, str) or not link.strip():
+                                continue
+
+                            absolute = urljoin(url, link)
+                            absolute, _ = urldefrag(absolute)
+
+                            if (
+                                    self._is_allowed_url(absolute)
+                                    and depth + 1 <= self.max_depth
+                                    and len(self.visited_urls) < max_pages
+                            ):
+                                await queue.add_url(absolute, depth + 1)
+
+                finally:
+                    queue.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(self.max_concurrent)]
         progress_task = asyncio.create_task(self._progress_logger(queue, interval=progress_interval))
 
         try:
-            await asyncio.gather(*workers)
+            await queue.join()
         finally:
+            for w in workers:
+                w.cancel()
+
+            await asyncio.gather(*workers, return_exceptions=True)
             await progress_task
-            await self.close()
 
         return results
 
@@ -384,3 +434,10 @@ class AsyncCrawler:
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+
+        # 🔹 Закрытие storage
+        if self.storage:
+            try:
+                await self.storage.close()
+            except Exception as e:
+                logger.error(f"Failed to close storage: {e}")

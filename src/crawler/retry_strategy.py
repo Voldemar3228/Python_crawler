@@ -29,13 +29,20 @@ class RetryStrategy:
         self.strategy = strategy
         self.on_retry = on_retry
 
-    async def execute_with_retry(self, coro: Callable, *args, **kwargs):
+    async def execute_with_retry(
+            self,
+            coro: Callable,
+            *args,
+            on_retry: Optional[Callable] = None,
+            **kwargs
+    ):
         attempt_counts = {err: 0 for err in self.strategy}
         url = kwargs.get("url", "unknown")
 
+        callback = on_retry or self.on_retry
+
         while True:
             try:
-                # просто вызываем корутину с текущей сессией и фиксированными таймаутами
                 return await coro(*args, **kwargs)
 
             except Exception as exc:
@@ -47,22 +54,19 @@ class RetryStrategy:
                     attempt = attempt_counts[exc_type]
 
                     if attempt > cfg.get("max_retries", 0):
-                        # максимальное число попыток достигнуто → проброс
-                        if self.on_retry:
-                            self.on_retry(exc, attempt, exc_type, delay=None, url=url)
+                        if callback:
+                            callback(exc, attempt, exc_type, delay=None, url=url)
                         raise
 
-                    # экспоненциальный backoff с jitter
                     delay = cfg.get("backoff_factor", 1.0) ** (attempt - 1)
                     jitter = random.random() * 0.5
                     total_delay = delay + jitter
 
-                    # вызываем callback с delay и url
-                    if self.on_retry:
-                        self.on_retry(exc, attempt, exc_type, delay=total_delay, url=url)
+                    if callback:
+                        callback(exc, attempt, exc_type, delay=total_delay, url=url)
 
                     await asyncio.sleep(total_delay)
 
                 else:
-                    # ошибка без стратегии → не ретраим
                     raise
+
