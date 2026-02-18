@@ -1,0 +1,20 @@
+# src/config_cli_advanced.yaml
+
+start_urls:
+  - https://example.com
+
+max_pages: 50
+
+crawler:
+  max_depth: 2
+  max_concurrent: 5
+  rate_limit: 1.0
+  respect_robots: true
+
+storage:
+  type: json
+  path: results.json
+
+logging:
+  level: INFO
+  file: crawler.log

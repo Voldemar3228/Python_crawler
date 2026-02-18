@@ -1,0 +1,35 @@
+# src/config.yaml
+
+crawler:
+  max_concurrent: 5
+  max_depth: 2
+  max_pages: 100
+  requests_per_second: 1.0
+  respect_robots: true
+  min_delay: 0.0
+  jitter: 0.5
+  user_agent: "AdvancedCrawler/1.0"
+
+start_urls:
+  - "https://example.com"
+
+filters:
+  include_patterns:
+    - ".*"
+  exclude_patterns:
+    - "/private"
+    - "/login"
+
+storage:
+  json:
+    enabled: true
+    filename: "results.json"
+    batch_size: 50
+  csv:
+    enabled: true
+    filename: "results.csv"
+    delimiter: ","
+  sqlite:
+    enabled: true
+    db_path: "results.db"
+    batch_size: 50

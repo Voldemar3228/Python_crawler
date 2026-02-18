@@ -1,0 +1,11 @@
+start_urls:
+  - https://example.com
+  - https://iana.org
+max_pages: 100
+max_depth: 3
+rate_limit: 1.5
+max_concurrent: 5
+respect_robots: true
+storage:
+  type: json
+  path: results.json

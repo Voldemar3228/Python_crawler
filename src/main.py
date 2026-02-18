@@ -1,108 +1,62 @@
-# demo.py
 import asyncio
-import json
-import csv
-import aiosqlite
-from datetime import datetime
-
 from crawler.async_crawler import AsyncCrawler
+from crawler.config_loader import ConfigLoader
 from storage.json_storage import JSONStorage
 from storage.csv_storage import CSVStorage
 from storage.sqlite_storage import SQLiteStorage
 
 
-async def demo():
-    # -----------------------
-    # 1️⃣ Создаём хранилища
-    # -----------------------
-    json_storage = JSONStorage("demo_results.json", batch_size=10)
-    csv_storage = CSVStorage("demo_results.csv", batch_size=10)
-    sqlite_storage = SQLiteStorage("demo_results.db", batch_size=10)
-    await sqlite_storage.init_db()
+async def main():
+    # 🔹 Загружаем конфигурацию
+    config = ConfigLoader("config.yaml")
+    crawler_settings = config.get_crawler_settings()
+    start_urls = config.get_start_urls()
+    filters = config.get_filters()
+    storage_config = config.get_storage_settings()
 
-    # -----------------------
-    # 2️⃣ Краулер с одновременным сохранением
-    # -----------------------
-    async with AsyncCrawler(
-        max_concurrent=3,
-        max_depth=1,
-        storage=None  # будем сохранять вручную после парсинга
-    ) as crawler:
+    # 🔹 Настраиваем хранилища
+    storages = []
 
-        # Функция для сохранения во все три хранилища
-        async def save_all(data):
-            await asyncio.gather(
-                json_storage.save(data),
-                csv_storage.save(data),
-                sqlite_storage.save(data)
-            )
+    if storage_config.get("json", {}).get("enabled"):
+        s = storage_config["json"]
+        storages.append(JSONStorage(s["filename"], batch_size=s.get("batch_size", 50)))
 
-        start_urls = ["https://example.com"]
-        results = []
+    if storage_config.get("csv", {}).get("enabled"):
+        s = storage_config["csv"]
+        storages.append(CSVStorage(s["filename"], delimiter=s.get("delimiter", ",")))
 
-        # Оборачиваем оригинальный _process_url, чтобы добавить сохранение
-        original_process = crawler._process_url
+    if storage_config.get("sqlite", {}).get("enabled"):
+        s = storage_config["sqlite"]
+        sqlite_store = SQLiteStorage(s["db_path"], batch_size=s.get("batch_size", 50))
+        await sqlite_store.init_db()
+        storages.append(sqlite_store)
 
-        async def _process_and_save(url):
-            standardized = await original_process(url)
-            if standardized:
-                await save_all(standardized)
-                results.append(standardized)
-            return standardized
+    # 🔹 Объединяем в один объект (пример: используем JSONStorage, можно добавить MultiStorage)
+    # Для простоты берем первое хранилище
+    storage = storages[0] if storages else None
 
-        crawler._process_url = _process_and_save  # временно заменяем метод
-
-        # Запускаем краулер
-        await crawler.crawl(start_urls, max_pages=5)
-
-    # -----------------------
-    # 3️⃣ Закрываем хранилища
-    # -----------------------
-    await asyncio.gather(
-        json_storage.close(),
-        csv_storage.close(),
-        sqlite_storage.close()
+    # 🔹 Инициализация краулера
+    crawler = AsyncCrawler(
+        max_concurrent=crawler_settings.get("max_concurrent", 5),
+        max_depth=crawler_settings.get("max_depth", 2),
+        include_patterns=filters.get("include_patterns"),
+        exclude_patterns=filters.get("exclude_patterns"),
+        requests_per_second=crawler_settings.get("requests_per_second", 1.0),
+        respect_robots=crawler_settings.get("respect_robots", True),
+        user_agent=crawler_settings.get("user_agent", "AdvancedCrawler/1.0"),
+        storage=storage
     )
 
-    # -----------------------
-    # 4️⃣ Статистика
-    # -----------------------
-    print("🔹 Statistics:")
-    print(f"Pages crawled: {len(results)}")
-    print(f"JSON pages: {len(results)}")
-    print(f"CSV pages: {len(results)}")
-    print(f"SQLite pages: {len(results)}\n")
+    # 🔹 Краулинг
+    async with crawler:
+        await crawler.crawl(start_urls, max_pages=crawler_settings.get("max_pages", 100))
 
-    # -----------------------
-    # 5️⃣ Чтение данных
-    # -----------------------
-    # JSON
-    print("Reading first 3 pages from JSON:")
-    with open("demo_results.json", "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i >= 3:
-                break
-            data = json.loads(line)
-            print(f"{i+1}. {data['url']} - {data['title']}")
+        # 🔹 Экспорт статистики
+        crawler.stats_exporter.export_to_json("stats.json")
+        crawler.stats_exporter.export_to_html_report("report.html")
 
-    # CSV
-    print("\nReading first 3 pages from CSV:")
-    with open("demo_results.csv", "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if i >= 3:
-                break
-            print(f"{i+1}. {row['url']} - {row['title']}")
+        # 🔹 Закрытие хранилища
+        if storage:
+            await storage.close()
 
-    # SQLite
-    print("\nReading first 3 pages from SQLite:")
-    async with aiosqlite.connect("demo_results.db") as db:
-        async with db.execute("SELECT url, title FROM pages LIMIT 3") as cursor:
-            i = 0
-            async for row in cursor:
-                i += 1
-                print(f"{i}. {row[0]} - {row[1]}")
-
-
-if __name__ == "__main__":
-    asyncio.run(demo())
+asyncio.run(main())

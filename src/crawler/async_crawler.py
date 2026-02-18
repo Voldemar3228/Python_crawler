@@ -24,6 +24,8 @@ from crawler.errors import (
 )
 from crawler.circuit_breaker import CircuitBreaker
 from storage.base import DataStorage
+from utils.stats import CrawlerStats
+from crawler.stats_exporter import CrawlerStatsExporter
 
 logger = setup_crawler_logger(level=logging.INFO)
 
@@ -91,6 +93,9 @@ class AsyncCrawler:
         # --- Allowed domains ---
         self.allowed_domains = allowed_domains
 
+        self.stats = CrawlerStats()
+        self.stats_exporter = CrawlerStatsExporter(self)
+
         def _on_retry(exc, attempt, exc_type):
             logger.warning(f"🔁 Retry {attempt} for {exc_type.__name__}: {exc}")
 
@@ -112,13 +117,13 @@ class AsyncCrawler:
             on_retry=_on_retry,
         )
 
-        # stats
-        self.stats = {
-            "errors": {},  # количество ошибок по типам, например: {"TransientError": 3}
-            "success_retries": 0,  # сколько успешных повторов было
-            "retry_times": [],  # время выполнения retry
-            "permanent_failed_urls": {}  # список URL с PermanentError
-        }
+        # # stats
+        # self.stats = {
+        #     "errors": {},  # количество ошибок по типам, например: {"TransientError": 3}
+        #     "success_retries": 0,  # сколько успешных повторов было
+        #     "retry_times": [],  # время выполнения retry
+        #     "permanent_failed_urls": {}  # список URL с PermanentError
+        # }
 
         # Timeouts logic
         self.connect_timeout = connect_timeout
@@ -305,6 +310,7 @@ class AsyncCrawler:
 
         html = await self.fetch_url(url)
         if not html:
+            self.stats.record_page(url=url, status_code=0, success=False)
             return None
 
         parsed = await self.parse_html(url, html)
@@ -318,13 +324,25 @@ class AsyncCrawler:
             "metadata": parsed.get("metadata", {}),
             "crawled_at": datetime.utcnow(),
             "status_code": parsed.get("status_code", 200),
-            "content_type": parsed.get("content_type", "text/html")
+            "content_type": parsed.get("content_type", "text/html"),
+            # Добавляем ключи для статистики
+            "images": parsed.get("images", []),
+            "lists": parsed.get("lists", {"ul": [], "ol": []}),
+            "tables": parsed.get("tables", []),
+            "headers": parsed.get("headers", {"h1": [], "h2": [], "h3": []}),
         }
 
         self.processed_urls[url] = standardized
         # 🔹 Добавляем сохранение данных через retry
         if self.storage:
             await self._save_with_retry(standardized)
+
+        self.stats.record_page(
+            url=url,
+            status_code=standardized["status_code"],
+            success=True,
+            request_time=self.request_times[-1] if self.request_times else 0
+        )
 
         return standardized
 
@@ -345,16 +363,21 @@ class AsyncCrawler:
 
     # --- Crawl engine ---
     async def crawl(self, start_urls: list[str], max_pages: int = 100, progress_interval: float = 2.0):
+        """Асинхронный краулинг стартовых URL с расширенной статистикой"""
+
+        # 🔹 Запуск таймера статистики
+        self.stats.start()
+
         queue = CrawlerQueue()
         results = []
 
+        # Добавляем стартовые URL
         for url in start_urls:
             if self._is_allowed_url(url):
                 await queue.add_url(url, 0)
 
         async def worker():
             nonlocal results
-
             while True:
                 url, depth = await queue.get_next()
 
@@ -362,10 +385,12 @@ class AsyncCrawler:
                     if url in self.visited_urls:
                         continue
 
+                    # 🔹 Обработка URL
                     parsed = await self._process_url(url)
                     if parsed:
                         results.append(parsed)
 
+                        # 🔹 Добавление новых ссылок в очередь
                         for link in parsed.get("links", []):
                             if not isinstance(link, str) or not link.strip():
                                 continue
@@ -383,18 +408,39 @@ class AsyncCrawler:
                 finally:
                     queue.task_done()
 
+        # Создаём воркеры
         workers = [asyncio.create_task(worker()) for _ in range(self.max_concurrent)]
         progress_task = asyncio.create_task(self._progress_logger(queue, interval=progress_interval))
 
         try:
+            # Ждём завершения всех задач в очереди
             await queue.join()
         finally:
+            # Отмена воркеров и ожидание их завершения
             for w in workers:
                 w.cancel()
-
             await asyncio.gather(*workers, return_exceptions=True)
             await progress_task
 
+        # 🔹 Завершаем сбор статистики
+        self.stats.stop()
+
+        # 🔹 Вывод расширенной статистики краулера
+        summary = self.stats.get_summary()
+        print("📊 Статистика краулера:")
+        print(summary)
+
+        # 🔹 Статистика содержимого страниц
+        from utils.stats import compute_overall_stats
+        content_stats = compute_overall_stats(list(self.processed_urls.values()))
+        print("📄 Статистика содержимого страниц:")
+        print(content_stats)
+
+        # 🔹 Экспорт результатов
+        self.stats_exporter.export_to_json("stats.json")
+        self.stats_exporter.export_to_html_report("report.html")
+
+        # 🔹 Возвращаем список обработанных страниц
         return results
 
     # --- Progress logger ---
